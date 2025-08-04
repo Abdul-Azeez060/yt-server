@@ -30,7 +30,7 @@ const app = express();
 const PORT = 3000;
 
 // Enable CORS for all routes
-app.use(cors());
+app.use(cors({ origin: "*" }));
 
 // Basic route to test server
 app.get("/", (req, res) => {
@@ -83,67 +83,178 @@ app.get("/download", async (req, res) => {
 
 // Separate function to handle the download process
 async function processDownload(videoURL, songId, res) {
-  const info = await ytdl.getInfo(videoURL);
-  console.log("Video info retrieved");
-  const title = info.videoDetails.title.replace(/[^\w\s]/gi, "");
+  try {
+    // Add options to bypass bot detection
+    const info = await ytdl.getInfo(videoURL, {
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept-Encoding': 'gzip, deflate',
+          'Cookie': 'CONSENT=YES+1'
+        }
+      }
+    });
+    
+    console.log("Video info retrieved");
+    const title = info.videoDetails.title.replace(/[^\w\s]/gi, "");
 
-  // Use /tmp directory for Vercel (serverless environments)
-  const previewsDir = process.env.VERCEL
-    ? "/tmp"
-    : path.join(__dirname, "../previews");
+    // Use /tmp directory for Vercel (serverless environments)
+    const previewsDir = process.env.VERCEL
+      ? "/tmp"
+      : path.join(__dirname, "../previews");
 
-  if (!process.env.VERCEL && !fs.existsSync(previewsDir)) {
-    fs.mkdirSync(previewsDir, { recursive: true });
+    if (!process.env.VERCEL && !fs.existsSync(previewsDir)) {
+      fs.mkdirSync(previewsDir, { recursive: true });
+    }
+
+    // Shorter filenames to avoid path length issues
+    const timestamp = Date.now();
+    const shortTitle = title.slice(0, 15).replace(/\s+/g, "_");
+    const videoPath = path.join(previewsDir, `${shortTitle}_v_${timestamp}.mp4`);
+    const audioPath = path.join(previewsDir, `${shortTitle}_a_${timestamp}.mp4`);
+    const fileName = `${shortTitle}_${timestamp}.mp4`;
+    const songFileName = `${shortTitle}_song_${timestamp}.mp3`;
+
+    console.log("Starting download process...");
+
+    // Use Promise-based approach with improved options
+    const downloadVideo = new Promise((resolve, reject) => {
+      const videoStream = ytdl(videoURL, {
+        quality: "highestvideo",
+        filter: (format) =>
+          format.container === "mp4" &&
+          (format.qualityLabel === "720p" || format.qualityLabel === "720p60"),
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Cookie': 'CONSENT=YES+1'
+          }
+        }
+      });
+
+      const videoWriteStream = fs.createWriteStream(videoPath);
+      videoStream.pipe(videoWriteStream);
+
+      videoWriteStream.on("finish", () => {
+        console.log("Video download completed");
+        resolve(videoPath);
+      });
+
+      videoWriteStream.on("error", reject);
+      videoStream.on("error", reject);
+    });
+
+    const downloadAudio = new Promise((resolve, reject) => {
+      const audioStream = ytdl(videoURL, {
+        quality: "highestaudio",
+        audioQuality: "AUDIO_QUALITY_HIGH",
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Cookie': 'CONSENT=YES+1'
+          }
+        }
+      });
+
+      const audioWriteStream = fs.createWriteStream(audioPath);
+      audioStream.pipe(audioWriteStream);
+
+      audioWriteStream.on("finish", () => {
+        console.log("Audio download completed");
+        resolve(audioPath);
+      });
+
+      audioWriteStream.on("error", reject);
+      audioStream.on("error", reject);
+    });
+
+    // Wait for both downloads to complete
+    await Promise.all([downloadVideo, downloadAudio]);
+
+    console.log("Both downloads completed, uploading to S3...");
+
+    // Upload files
+    const videoBuffer = fs.readFileSync(videoPath);
+    const audioBuffer = fs.readFileSync(audioPath);
+
+    // Upload video to video-previews folder
+    const videoUploadParams = {
+      Bucket: process.env.AWS_BUCKET_NAME,
+      Key: `video-previews/${fileName}`,
+      Body: videoBuffer,
+      ContentType: "video/mp4",
+      ACL: "public-read",
+    };
+
+    // Upload audio to audio folder
+    const audioUploadParams = {
+      Bucket: process.env.AWS_BUCKET_NAME,
+      Key: `video-previews/audio/${songFileName}`,
+      Body: audioBuffer,
+      ContentType: "audio/mp4",
+      ACL: "public-read",
+    };
+
+    // Upload both files
+    const videoCommand = new PutObjectCommand(videoUploadParams);
+    const audioCommand = new PutObjectCommand(audioUploadParams);
+
+    await Promise.all([s3Client.send(videoCommand), s3Client.send(audioCommand)]);
+
+    // Generate CDN URLs
+    const videoCdnUrl = process.env.CLOUDFRONT_URL
+      ? `${process.env.CLOUDFRONT_URL}/${fileName}`
+      : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/video-previews/${fileName}`;
+
+    const audioCdnUrl = process.env.CLOUDFRONT_URL
+      ? `${process.env.CLOUDFRONT_URL}/audio/${songFileName}`
+      : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/audio/${songFileName}`;
+
+    console.log("Upload successful - Video:", videoCdnUrl);
+    console.log("Upload successful - Audio:", audioCdnUrl);
+
+    // Clean up temporary files
+    try {
+      if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+      if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    } catch (cleanupError) {
+      console.warn("Cleanup error:", cleanupError);
+    }
+
+    // Save to Appwrite collection
+    try {
+      const document = await databases.createDocument(
+        process.env.APPWRITE_DATABASE_ID,
+        process.env.APPWRITE_COLLECTION_ID,
+        ID.unique(),
+        {
+          song_id: songId,
+          audio_url: audioCdnUrl,
+          aws_url: videoCdnUrl,
+        }
+      );
+      console.log("Data saved to Appwrite:", document.$id);
+    } catch (appwriteError) {
+      console.error("Appwrite save error:", appwriteError);
+      // Continue with response even if Appwrite fails
+    }
+
+    // Return both URLs
+    res.json({
+      success: true,
+      message: "Video and audio uploaded successfully",
+      aws_url: videoCdnUrl,
+      audio_url: audioCdnUrl,
+      songId: songId,
+    });
+
+  } catch (processError) {
+    console.error("Process download error:", processError);
+    throw processError; // Re-throw to be handled by the main catch block
   }
-
-  // Shorter filenames to avoid path length issues
-  const timestamp = Date.now();
-  const shortTitle = title.slice(0, 15).replace(/\s+/g, "_");
-  const videoPath = path.join(previewsDir, `${shortTitle}_v_${timestamp}.mp4`);
-  const audioPath = path.join(previewsDir, `${shortTitle}_a_${timestamp}.mp4`);
-  const fileName = `${shortTitle}_${timestamp}.mp4`;
-  const songFileName = `${shortTitle}_song_${timestamp}.mp3`;
-
-  console.log("Starting download process...");
-
-  // Use Promise-based approach instead of event listeners for better error handling
-  const downloadVideo = new Promise((resolve, reject) => {
-    const videoStream = ytdl(videoURL, {
-      quality: "highestvideo",
-      filter: (format) =>
-        format.container === "mp4" &&
-        (format.qualityLabel === "720p" || format.qualityLabel === "720p60"),
-    });
-
-    const videoWriteStream = fs.createWriteStream(videoPath);
-    videoStream.pipe(videoWriteStream);
-
-    videoWriteStream.on("finish", () => {
-      console.log("Video download completed");
-      resolve(videoPath);
-    });
-
-    videoWriteStream.on("error", reject);
-    videoStream.on("error", reject);
-  });
-
-  const downloadAudio = new Promise((resolve, reject) => {
-    const audioStream = ytdl(videoURL, {
-      quality: "highestaudio",
-      audioQuality: "AUDIO_QUALITY_HIGH",
-    });
-
-    const audioWriteStream = fs.createWriteStream(audioPath);
-    audioStream.pipe(audioWriteStream);
-
-    audioWriteStream.on("finish", () => {
-      console.log("Audio download completed");
-      resolve(audioPath);
-    });
-
-    audioWriteStream.on("error", reject);
-    audioStream.on("error", reject);
-  });
+}
 
   // Wait for both downloads to complete
   await Promise.all([downloadVideo, downloadAudio]);
@@ -224,6 +335,11 @@ async function processDownload(videoURL, songId, res) {
     audio_url: audioCdnUrl,
     songId: songId,
   });
+
+  } catch (processError) {
+    console.error("Process download error:", processError);
+    throw processError; // Re-throw to be handled by the main catch block
+  }
 }
 
 app.listen(PORT, () => {
