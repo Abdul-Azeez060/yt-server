@@ -42,6 +42,13 @@ app.get("/download", async (req, res) => {
   const videoURL = req.query.url;
   const songId = req.query.song_id;
 
+  // Add response headers for better debugging
+  res.setHeader("X-Function-Region", process.env.VERCEL_REGION || "unknown");
+  res.setHeader(
+    "X-Function-Environment",
+    process.env.VERCEL ? "vercel" : "local"
+  );
+
   if (!videoURL || !ytdl.validateURL(videoURL)) {
     return res.status(400).json({ error: "Invalid or missing YouTube URL" });
   }
@@ -50,8 +57,10 @@ app.get("/download", async (req, res) => {
     return res.status(400).json({ error: "Missing song_id parameter" });
   }
 
+  console.log("Environment:", process.env.VERCEL ? "Vercel" : "Local");
   console.log("Received URL:", videoURL);
   console.log("Song ID:", songId);
+  console.log("Memory limit:", process.memoryUsage());
 
   try {
     // Set timeout for the entire operation (Vercel has 10-30s limits)
@@ -64,6 +73,8 @@ app.get("/download", async (req, res) => {
     await Promise.race([downloadPromise, timeoutPromise]);
   } catch (error) {
     console.error("Download error:", error);
+    console.error("Error stack:", error.stack);
+    console.error("Memory usage at error:", process.memoryUsage());
 
     // More detailed error logging
     if (error.message === "Operation timeout") {
@@ -73,9 +84,19 @@ app.get("/download", async (req, res) => {
       });
     }
 
+    // Handle specific ytdl errors
+    if (error.message.includes("Sign in to confirm")) {
+      return res.status(403).json({
+        error: "YouTube access restricted",
+        details:
+          "YouTube is blocking automated requests. Please try again later.",
+      });
+    }
+
     return res.status(500).json({
       error: "An error occurred while processing the request",
       details: error.message || error,
+      errorType: error.constructor.name,
       stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
     });
   }
@@ -88,15 +109,17 @@ async function processDownload(videoURL, songId, res) {
     const info = await ytdl.getInfo(videoURL, {
       requestOptions: {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate',
-          'Cookie': 'CONSENT=YES+1'
-        }
-      }
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.5",
+          "Accept-Encoding": "gzip, deflate",
+          Cookie: "CONSENT=YES+1",
+        },
+      },
     });
-    
+
     console.log("Video info retrieved");
     const title = info.videoDetails.title.replace(/[^\w\s]/gi, "");
 
@@ -112,8 +135,14 @@ async function processDownload(videoURL, songId, res) {
     // Shorter filenames to avoid path length issues
     const timestamp = Date.now();
     const shortTitle = title.slice(0, 15).replace(/\s+/g, "_");
-    const videoPath = path.join(previewsDir, `${shortTitle}_v_${timestamp}.mp4`);
-    const audioPath = path.join(previewsDir, `${shortTitle}_a_${timestamp}.mp4`);
+    const videoPath = path.join(
+      previewsDir,
+      `${shortTitle}_v_${timestamp}.mp4`
+    );
+    const audioPath = path.join(
+      previewsDir,
+      `${shortTitle}_a_${timestamp}.mp4`
+    );
     const fileName = `${shortTitle}_${timestamp}.mp4`;
     const songFileName = `${shortTitle}_song_${timestamp}.mp3`;
 
@@ -128,10 +157,11 @@ async function processDownload(videoURL, songId, res) {
           (format.qualityLabel === "720p" || format.qualityLabel === "720p60"),
         requestOptions: {
           headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Cookie': 'CONSENT=YES+1'
-          }
-        }
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            Cookie: "CONSENT=YES+1",
+          },
+        },
       });
 
       const videoWriteStream = fs.createWriteStream(videoPath);
@@ -152,10 +182,11 @@ async function processDownload(videoURL, songId, res) {
         audioQuality: "AUDIO_QUALITY_HIGH",
         requestOptions: {
           headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Cookie': 'CONSENT=YES+1'
-          }
-        }
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            Cookie: "CONSENT=YES+1",
+          },
+        },
       });
 
       const audioWriteStream = fs.createWriteStream(audioPath);
@@ -201,7 +232,10 @@ async function processDownload(videoURL, songId, res) {
     const videoCommand = new PutObjectCommand(videoUploadParams);
     const audioCommand = new PutObjectCommand(audioUploadParams);
 
-    await Promise.all([s3Client.send(videoCommand), s3Client.send(audioCommand)]);
+    await Promise.all([
+      s3Client.send(videoCommand),
+      s3Client.send(audioCommand),
+    ]);
 
     // Generate CDN URLs
     const videoCdnUrl = process.env.CLOUDFRONT_URL
@@ -249,93 +283,6 @@ async function processDownload(videoURL, songId, res) {
       audio_url: audioCdnUrl,
       songId: songId,
     });
-
-  } catch (processError) {
-    console.error("Process download error:", processError);
-    throw processError; // Re-throw to be handled by the main catch block
-  }
-}
-
-  // Wait for both downloads to complete
-  await Promise.all([downloadVideo, downloadAudio]);
-
-  console.log("Both downloads completed, uploading to S3...");
-
-  // Upload files
-  const videoBuffer = fs.readFileSync(videoPath);
-  const audioBuffer = fs.readFileSync(audioPath);
-
-  // Upload video to video-previews folder
-  const videoUploadParams = {
-    Bucket: process.env.AWS_BUCKET_NAME,
-    Key: `video-previews/${fileName}`,
-    Body: videoBuffer,
-    ContentType: "video/mp4",
-    ACL: "public-read",
-  };
-
-  // Upload audio to audio folder
-  const audioUploadParams = {
-    Bucket: process.env.AWS_BUCKET_NAME,
-    Key: `video-previews/audio/${songFileName}`,
-    Body: audioBuffer,
-    ContentType: "audio/mp4",
-    ACL: "public-read",
-  };
-
-  // Upload both files
-  const videoCommand = new PutObjectCommand(videoUploadParams);
-  const audioCommand = new PutObjectCommand(audioUploadParams);
-
-  await Promise.all([s3Client.send(videoCommand), s3Client.send(audioCommand)]);
-
-  // Generate CDN URLs
-  const videoCdnUrl = process.env.CLOUDFRONT_URL
-    ? `${process.env.CLOUDFRONT_URL}/${fileName}`
-    : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/video-previews/${fileName}`;
-
-  const audioCdnUrl = process.env.CLOUDFRONT_URL
-    ? `${process.env.CLOUDFRONT_URL}/audio/${songFileName}`
-    : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/audio/${songFileName}`;
-
-  console.log("Upload successful - Video:", videoCdnUrl);
-  console.log("Upload successful - Audio:", audioCdnUrl);
-
-  // Clean up temporary files
-  try {
-    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
-    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-  } catch (cleanupError) {
-    console.warn("Cleanup error:", cleanupError);
-  }
-
-  // Save to Appwrite collection
-  try {
-    const document = await databases.createDocument(
-      process.env.APPWRITE_DATABASE_ID,
-      process.env.APPWRITE_COLLECTION_ID,
-      ID.unique(),
-      {
-        song_id: songId,
-        audio_url: audioCdnUrl,
-        aws_url: videoCdnUrl,
-      }
-    );
-    console.log("Data saved to Appwrite:", document.$id);
-  } catch (appwriteError) {
-    console.error("Appwrite save error:", appwriteError);
-    // Continue with response even if Appwrite fails
-  }
-
-  // Return both URLs
-  res.json({
-    success: true,
-    message: "Video and audio uploaded successfully",
-    aws_url: videoCdnUrl,
-    audio_url: audioCdnUrl,
-    songId: songId,
-  });
-
   } catch (processError) {
     console.error("Process download error:", processError);
     throw processError; // Re-throw to be handled by the main catch block
