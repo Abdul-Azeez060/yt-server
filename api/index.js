@@ -54,23 +54,60 @@ app.get("/download", async (req, res) => {
   console.log("Song ID:", songId);
 
   try {
-    const info = await ytdl.getInfo(videoURL);
-    console.log("Video info retrieved:", info);
-    const title = info.videoDetails.title.replace(/[^\w\s]/gi, "");
+    // Set timeout for the entire operation (Vercel has 10-30s limits)
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("Operation timeout")), 25000); // 25 seconds
+    });
 
-    // Create previews directory if it doesn't exist
-    const previewsDir = path.join(__dirname, "../previews");
-    if (!fs.existsSync(previewsDir)) {
-      fs.mkdirSync(previewsDir, { recursive: true });
+    const downloadPromise = processDownload(videoURL, songId, res);
+
+    await Promise.race([downloadPromise, timeoutPromise]);
+  } catch (error) {
+    console.error("Download error:", error);
+
+    // More detailed error logging
+    if (error.message === "Operation timeout") {
+      return res.status(408).json({
+        error: "Request timeout - video processing took too long",
+        details: "Please try with a shorter video or try again later",
+      });
     }
 
-    // Set file paths
-    const videoPath = path.join(previewsDir, `${title.slice(0, 25)}_video.mp4`);
-    const audioPath = path.join(previewsDir, `${title.slice(0, 25)}_audio.mp4`);
-    const fileName = `${title.slice(0, 25)}_${Date.now()}.mp4`;
-    const songFileName = `${title.slice(0, 25)}_song.mp3`;
+    return res.status(500).json({
+      error: "An error occurred while processing the request",
+      details: error.message || error,
+      stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
+    });
+  }
+});
 
-    // Download highest quality video (720p)
+// Separate function to handle the download process
+async function processDownload(videoURL, songId, res) {
+  const info = await ytdl.getInfo(videoURL);
+  console.log("Video info retrieved");
+  const title = info.videoDetails.title.replace(/[^\w\s]/gi, "");
+
+  // Use /tmp directory for Vercel (serverless environments)
+  const previewsDir = process.env.VERCEL
+    ? "/tmp"
+    : path.join(__dirname, "../previews");
+
+  if (!process.env.VERCEL && !fs.existsSync(previewsDir)) {
+    fs.mkdirSync(previewsDir, { recursive: true });
+  }
+
+  // Shorter filenames to avoid path length issues
+  const timestamp = Date.now();
+  const shortTitle = title.slice(0, 15).replace(/\s+/g, "_");
+  const videoPath = path.join(previewsDir, `${shortTitle}_v_${timestamp}.mp4`);
+  const audioPath = path.join(previewsDir, `${shortTitle}_a_${timestamp}.mp4`);
+  const fileName = `${shortTitle}_${timestamp}.mp4`;
+  const songFileName = `${shortTitle}_song_${timestamp}.mp3`;
+
+  console.log("Starting download process...");
+
+  // Use Promise-based approach instead of event listeners for better error handling
+  const downloadVideo = new Promise((resolve, reject) => {
     const videoStream = ytdl(videoURL, {
       quality: "highestvideo",
       filter: (format) =>
@@ -78,151 +115,116 @@ app.get("/download", async (req, res) => {
         (format.qualityLabel === "720p" || format.qualityLabel === "720p60"),
     });
 
-    // Download highest quality audio
+    const videoWriteStream = fs.createWriteStream(videoPath);
+    videoStream.pipe(videoWriteStream);
+
+    videoWriteStream.on("finish", () => {
+      console.log("Video download completed");
+      resolve(videoPath);
+    });
+
+    videoWriteStream.on("error", reject);
+    videoStream.on("error", reject);
+  });
+
+  const downloadAudio = new Promise((resolve, reject) => {
     const audioStream = ytdl(videoURL, {
       quality: "highestaudio",
       audioQuality: "AUDIO_QUALITY_HIGH",
     });
 
-    console.log("Starting video and audio download...");
-
-    // Download video and audio simultaneously
-    const videoWriteStream = fs.createWriteStream(videoPath);
     const audioWriteStream = fs.createWriteStream(audioPath);
-
-    videoStream.pipe(videoWriteStream);
     audioStream.pipe(audioWriteStream);
-
-    let videoComplete = false;
-    let audioComplete = false;
-
-    // Check if both downloads are complete
-    const checkCompletion = async () => {
-      if (videoComplete && audioComplete) {
-        console.log("Both video and audio downloaded, uploading to S3...");
-        await uploadBothFiles();
-      }
-    };
-
-    videoWriteStream.on("finish", () => {
-      console.log("Video download completed");
-      videoComplete = true;
-      checkCompletion();
-    });
 
     audioWriteStream.on("finish", () => {
       console.log("Audio download completed");
-      audioComplete = true;
-      checkCompletion();
+      resolve(audioPath);
     });
 
-    // Upload both video and audio to S3
-    const uploadBothFiles = async () => {
-      try {
-        // Read both files
-        const videoBuffer = fs.readFileSync(videoPath);
-        const audioBuffer = fs.readFileSync(audioPath);
+    audioWriteStream.on("error", reject);
+    audioStream.on("error", reject);
+  });
 
-        // Upload video to video-previews folder
-        const videoUploadParams = {
-          Bucket: process.env.AWS_BUCKET_NAME,
-          Key: `video-previews/${fileName}`,
-          Body: videoBuffer,
-          ContentType: "video/mp4",
-          ACL: "public-read",
-        };
+  // Wait for both downloads to complete
+  await Promise.all([downloadVideo, downloadAudio]);
 
-        // Upload audio to audio folder
-        const audioUploadParams = {
-          Bucket: process.env.AWS_BUCKET_NAME,
-          Key: `video-previews/audio/${songFileName}`,
-          Body: audioBuffer,
-          ContentType: "audio/mp4",
-          ACL: "public-read",
-        };
+  console.log("Both downloads completed, uploading to S3...");
 
-        // Upload both files
-        const videoCommand = new PutObjectCommand(videoUploadParams);
-        const audioCommand = new PutObjectCommand(audioUploadParams);
+  // Upload files
+  const videoBuffer = fs.readFileSync(videoPath);
+  const audioBuffer = fs.readFileSync(audioPath);
 
-        await Promise.all([
-          s3Client.send(videoCommand),
-          s3Client.send(audioCommand),
-        ]);
+  // Upload video to video-previews folder
+  const videoUploadParams = {
+    Bucket: process.env.AWS_BUCKET_NAME,
+    Key: `video-previews/${fileName}`,
+    Body: videoBuffer,
+    ContentType: "video/mp4",
+    ACL: "public-read",
+  };
 
-        // Generate CDN URLs
-        const videoCdnUrl = process.env.CLOUDFRONT_URL
-          ? `${process.env.CLOUDFRONT_URL}/${fileName}`
-          : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/video-previews/${fileName}`;
+  // Upload audio to audio folder
+  const audioUploadParams = {
+    Bucket: process.env.AWS_BUCKET_NAME,
+    Key: `video-previews/audio/${songFileName}`,
+    Body: audioBuffer,
+    ContentType: "audio/mp4",
+    ACL: "public-read",
+  };
 
-        const audioCdnUrl = process.env.CLOUDFRONT_URL
-          ? `${process.env.CLOUDFRONT_URL}/audio/${songFileName}`
-          : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/audio/${songFileName}`;
+  // Upload both files
+  const videoCommand = new PutObjectCommand(videoUploadParams);
+  const audioCommand = new PutObjectCommand(audioUploadParams);
 
-        console.log("Upload successful - Video:", videoCdnUrl);
-        console.log("Upload successful - Audio:", audioCdnUrl);
+  await Promise.all([s3Client.send(videoCommand), s3Client.send(audioCommand)]);
 
-        // Delete local files
-        fs.unlinkSync(videoPath);
-        fs.unlinkSync(audioPath);
+  // Generate CDN URLs
+  const videoCdnUrl = process.env.CLOUDFRONT_URL
+    ? `${process.env.CLOUDFRONT_URL}/${fileName}`
+    : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/video-previews/${fileName}`;
 
-        // Save to Appwrite collection
-        try {
-          const document = await databases.createDocument(
-            process.env.APPWRITE_DATABASE_ID,
-            process.env.APPWRITE_COLLECTION_ID,
-            ID.unique(),
-            {
-              song_id: songId,
-              audio_url: audioCdnUrl,
-              aws_url: videoCdnUrl,
-            }
-          );
-          console.log("Data saved to Appwrite:", document.$id);
-        } catch (appwriteError) {
-          console.error("Appwrite save error:", appwriteError);
-          // Continue with response even if Appwrite fails
-        }
+  const audioCdnUrl = process.env.CLOUDFRONT_URL
+    ? `${process.env.CLOUDFRONT_URL}/audio/${songFileName}`
+    : `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_DEFAULT_REGION}.amazonaws.com/audio/${songFileName}`;
 
-        // Return both URLs
-        res.json({
-          success: true,
-          message: "Video and audio uploaded successfully",
-          aws_url: videoCdnUrl,
-          audio_url: audioCdnUrl,
-          songId: songId,
-        });
-      } catch (uploadError) {
-        console.error("Upload error:", uploadError);
-        res.status(500).json({
-          error: "Failed to upload to S3",
-          details: uploadError,
-        });
-      }
-    };
+  console.log("Upload successful - Video:", videoCdnUrl);
+  console.log("Upload successful - Audio:", audioCdnUrl);
 
-    // Handle download errors
-    videoWriteStream.on("error", (error) => {
-      console.error("Video download error:", error);
-      res
-        .status(500)
-        .json({ error: "Failed to download video", details: error.message });
-    });
-
-    audioWriteStream.on("error", (error) => {
-      console.error("Audio download error:", error);
-      res
-        .status(500)
-        .json({ error: "Failed to download audio", details: error.message });
-    });
-  } catch (error) {
-    console.log(error);
-    res.status(500).json({
-      error: "An error occurred while processing the request",
-      details: error,
-    });
+  // Clean up temporary files
+  try {
+    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+  } catch (cleanupError) {
+    console.warn("Cleanup error:", cleanupError);
   }
-});
+
+  // Save to Appwrite collection
+  try {
+    const document = await databases.createDocument(
+      process.env.APPWRITE_DATABASE_ID,
+      process.env.APPWRITE_COLLECTION_ID,
+      ID.unique(),
+      {
+        song_id: songId,
+        audio_url: audioCdnUrl,
+        aws_url: videoCdnUrl,
+      }
+    );
+    console.log("Data saved to Appwrite:", document.$id);
+  } catch (appwriteError) {
+    console.error("Appwrite save error:", appwriteError);
+    // Continue with response even if Appwrite fails
+  }
+
+  // Return both URLs
+  res.json({
+    success: true,
+    message: "Video and audio uploaded successfully",
+    aws_url: videoCdnUrl,
+    audio_url: audioCdnUrl,
+    songId: songId,
+  });
+}
 
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
